@@ -461,7 +461,7 @@ extern struct settings settings;
 /**
  * Structure for storing items within memcached.
  */
-typedef struct _stritem {
+typedef struct _stritem {   //存放 key-value 数据的结构体 item
     /* Protected by LRU locks */
     struct _stritem *next;
     struct _stritem *prev;
@@ -470,7 +470,7 @@ typedef struct _stritem {
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
-    unsigned short  refcount;
+    unsigned short  refcount;   /* 引用计数,只要有线程操作该item就会++1 */
     uint8_t         nsuffix;    /* length of flags-and-length string */
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */

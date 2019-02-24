@@ -26,16 +26,16 @@
 /* powers-of-N allocation structures */
 
 typedef struct {
-    unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
+    unsigned int size;      /* sizes of items */                    /* item区域大小 */
+    unsigned int perslab;   /* how many items per slab */           /* 每个chunk下可以保存item数量 */
+    
+    void *slots;           /* list of item ptrs */                  /* 空闲的item */
+    unsigned int sl_curr;   /* total free items in list */          /* 空闲的item数量 */
 
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
+    unsigned int slabs;     /* how many slabs were allocated for this class */      /* chunk指针数组数量 */
 
-    unsigned int slabs;     /* how many slabs were allocated for this class */
-
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
+    void **slab_list;       /* array of slab pointers */                            /* chunk指针数组 */
+    unsigned int list_size; /* size of prev array */                                /* 预申请chunk指针数组的数量 */
 
     size_t requested; /* The number of requested bytes */
 } slabclass_t;
@@ -156,6 +156,10 @@ static void * alloc_large_chunk_linux(const size_t limit)
  */
 void slabs_init(const size_t limit, const double factor, const bool prealloc, const uint32_t *slab_sizes) {
     int i = POWER_SMALLEST - 1;
+    //最小数据块size
+    //sizeof(item) 存放数据的结构体 = 32 
+    //settings.chunk_size 默认存放物理数据大小 = 48
+    //size = 48 + 32 = 80/Byte
     unsigned int size = sizeof(item) + settings.chunk_size;
 
     /* Some platforms use runtime transparent hugepages. If for any reason
@@ -164,8 +168,10 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
      * preallocation. */
     bool __attribute__ ((unused)) do_slab_prealloc = false;
 
+    //申请的内存总大小默认64M
     mem_limit = limit;
 
+    //是否预申请一块内存区域,并直接指向该内存区域
     if (prealloc) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
         mem_base = alloc_large_chunk_linux(mem_limit);
@@ -185,8 +191,11 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
         }
     }
 
+    //slabclass数组置空
     memset(slabclass, 0, sizeof(slabclass));
 
+    //按照 size * factor 填充 slabclass 数组 
+    //不能超过 MAX_NUMBER_OF_SLAB_CLASSES - 1 &&  保证 size * factor 不能大于 settings.item_size_max
     while (++i < MAX_NUMBER_OF_SLAB_CLASSES-1) {
         if (slab_sizes != NULL) {
             if (slab_sizes[i-1] == 0)
@@ -196,20 +205,24 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             break;
         }
         /* Make sure items are always n-byte aligned */
-        if (size % CHUNK_ALIGN_BYTES)
+        if (size % CHUNK_ALIGN_BYTES)   //8字节对齐
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
 
+        //每个slabclass组可存放item的大小
         slabclass[i].size = size;
+        //每个chunk下可以保存item数量
         slabclass[i].perslab = settings.slab_page_size / slabclass[i].size;
         if (slab_sizes == NULL)
-            size *= factor;
+            size *= factor;     //乘与增长因子继续填充
         if (settings.verbose > 1) {
             fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
                     i, slabclass[i].size, slabclass[i].perslab);
         }
     }
 
+    //保存最后一个元素的索引位置
     power_largest = i;
+    //保证slab组最后一个可存放的item大小为settings.item_size_max 也就是1M
     slabclass[power_largest].size = settings.slab_chunk_size_max;
     slabclass[power_largest].perslab = settings.slab_page_size / settings.slab_chunk_size_max;
     if (settings.verbose > 1) {
@@ -226,6 +239,9 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 
     }
 
+    //如果是预申请则按照每个 slabclass[i].size 区域大小去划分
+    //chunk_1 -> [item-24Byte、item-24Byte、item-24Byte]
+    //chunk_2 -> [item-48Byte、item-48Byte、item-48Byte]
     if (prealloc && do_slab_prealloc) {
         slabs_preallocate(power_largest);
     }
@@ -244,6 +260,7 @@ void slabs_prefill_global(void) {
     mem_limit_reached = true;
 }
 
+//slabs_preallocate 对预申请的内存进行划分
 static void slabs_preallocate (const unsigned int maxslabs) {
     int i;
     unsigned int prealloc = 0;
@@ -255,8 +272,10 @@ static void slabs_preallocate (const unsigned int maxslabs) {
        these three lines.  */
 
     for (i = POWER_SMALLEST; i < MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+        // 判断是否超出当前slabclass最大索引
         if (++prealloc > maxslabs)
             return;
+        //一个一个进行划分    
         if (do_slabs_newslab(i) == 0) {
             fprintf(stderr, "Error while preallocating slab memory!\n"
                 "If using -L or other prealloc options, max memory must be "
@@ -266,22 +285,32 @@ static void slabs_preallocate (const unsigned int maxslabs) {
     }
 }
 
+//grow_slab_list 获取chunk指针数组，不存在则创建，存在且空间不够则扩容
 static int grow_slab_list (const unsigned int id) {
     slabclass_t *p = &slabclass[id];
+    // 判断当前 chunk指针数组索引 是否等于 list_size 如果等于就会进行扩容
+    // 初始化情况会等于
     if (p->slabs == p->list_size) {
+        // 默认 slab_list 数组大小 16 
+        // 之后在扩充每次2的倍数进行扩容
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
         if (new_list == 0) return 0;
+        // 预申请 chunk 指针数组的数量
         p->list_size = new_size;
+        // 指向该数组
         p->slab_list = new_list;
     }
     return 1;
 }
 
+//根据给定的 chunk区域指针 进行划分item
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int x;
+    // 当前chunk区域共有多少 perslab 就是 item
     for (x = 0; x < p->perslab; x++) {
+        // 一个一个进行划分
         do_slabs_free(ptr, 0, id);
         ptr += p->size;
     }
@@ -298,14 +327,24 @@ static void *get_page_from_global_pool(void) {
     return ret;
 }
 
+//do_slabs_newslab 根据每个slabclass区域大小进行划分
 static int do_slabs_newslab(const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     slabclass_t *g = &slabclass[SLAB_GLOBAL_PAGE_POOL];
+
+    // 获取待申请chunk大小，理论上每个 chunk <= 1M(1048576/Byte)
+    // 但是有些情况 size * perslab 不会正好等于 1M 而是小于 1M
+    // 那么我们按照1M申请就会有一些字节浪费掉.
+    // 比如第一个slabclass的区域是 80/Byte 如果按每个chunk为1M 那么 perslab = 1M/80 = 13107/item 
+    // 就是一个chunk里面会有13107个item , 但是 13107 * 80 = 1048560/Byte 小于 1M(1048576/Byte)
+    // 所以这里的判断就是按照什么方式去申请这chunk空间，如果不想有字节浪费掉就   p->size * p->perslab
+        
     int len = (settings.slab_reassign || settings.slab_chunk_size_max != settings.slab_page_size)
         ? settings.slab_page_size
         : p->size * p->perslab;
     char *ptr;
 
+    // 判断内存使用是否超过最大设定
     if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0
          && g->slabs == 0)) {
         mem_limit_reached = true;
@@ -313,6 +352,9 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
+    // grow_slab_list 获取chunk指针数组，就是 void **slab_list 、 list_size
+    // get_page_from_global_pool 忽略.
+    // memory_allocate 申请一块 chunk 区域,并更新内存使用量
     if ((grow_slab_list(id) == 0) ||
         (((ptr = get_page_from_global_pool()) == NULL) &&
         ((ptr = memory_allocate((size_t)len)) == 0))) {
@@ -321,9 +363,12 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
+    // chunk指针初始化置空
     memset(ptr, 0, (size_t)len);
+    // chunk区域有了，就在chunk中进行划分item
     split_slab_page_into_freelist(ptr, id);
 
+    // 保存当前chunk的指针, 并更新 p->slabs++ 
     p->slab_list[p->slabs++] = ptr;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
@@ -438,7 +483,7 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
     return;
 }
 
-
+//划分item
 static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     slabclass_t *p;
     item *it;
@@ -450,18 +495,21 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     MEMCACHED_SLABS_FREE(size, id, ptr);
     p = &slabclass[id];
 
-    it = (item *)ptr;
+    it = (item *)ptr;   //强制转换成item结构体指针
     if ((it->it_flags & ITEM_CHUNKED) == 0) {
 #ifdef EXTSTORE
         bool is_hdr = it->it_flags & ITEM_HDR;
 #endif
         it->it_flags = ITEM_SLABBED;
         it->slabs_clsid = 0;
+        // 每一个item都已双向链表形式连接
         it->prev = 0;
         it->next = p->slots;
         if (it->next) it->next->prev = it;
+        // slots 一直指向这个空闲item链表
         p->slots = it;
 
+        // 更新一下当前可使用item数量
         p->sl_curr++;
 #ifdef EXTSTORE
         if (!is_hdr) {
@@ -605,15 +653,19 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
     add_stats(NULL, 0, NULL, 0, c);
 }
 
+//memory_allocate 申请一块 chunk 区域 , 并更新内存使用量
 static void *memory_allocate(size_t size) {
     void *ret;
 
+    // 判断是否为预申请模式，如果不是则每次 malloc 申请 1M
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
         ret = malloc(size);
     } else {
+        //当前内存使用位置
         ret = mem_current;
 
+        // size 不能大于最大的mem_avail内存块
         if (size > mem_avail) {
             return NULL;
         }
@@ -623,15 +675,21 @@ static void *memory_allocate(size_t size) {
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
         }
 
+        // 获取一块size大小内存,并更新内存使用位置
         mem_current = ((char*)mem_current) + size;
+
+        // 更新一下mem_avail，就是还剩多少内存
         if (size < mem_avail) {
             mem_avail -= size;
         } else {
             mem_avail = 0;
         }
     }
+
+    //更新一下内存使用量， 就是已使用了多少内存 
     mem_malloced += size;
 
+    // 返回当前申请的内存，也就是 chunk 区域 
     return ret;
 }
 
