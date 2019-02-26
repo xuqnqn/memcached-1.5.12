@@ -5566,19 +5566,32 @@ static void drive_machine(conn *c) {
             /* Only process nreqs at a time to avoid starving other
                connections */
 
+            // 即使缓冲区buf有很多命令包, 但该连接一次最多循环执行 nreqs 个命令数据包 ,
+            // 防止该连接事件一直占用当前函数 , 别的连接事件无法处理
             --nreqs;
             if (nreqs >= 0) {
+                // 重置当前连接状态
                 reset_cmd_handler(c);
             } else {
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.conn_yields++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                //判断当前缓冲区buf是否还有数据
                 if (c->rbytes > 0) {
                     /* We have already read in data into the input buffer,
                        so libevent will most likely not signal read events
                        on the socket (unless more data is available. As a
                        hack we should just put in a request to write data,
                        because that should be possible ;-)
+                    */
+
+                    /* 
+                        如果buf还有数据, 就不能马上退出, 需要处理, 但是已经达到 nreqs 限额了,
+                        必须让出当前函数，交由其他的连接事件进行处理, 所以这里用了一个技巧, 
+                        把当前连接事件变成 EV_WRITE , 因为当前连接的(写)网络缓冲区没有数据,
+                        从而达到低于等于最低水位, 重新触发事件, 继续回调本函数, 进行处理buf剩
+                        余的数据包
                     */
                     if (!update_event(c, EV_WRITE | EV_PERSIST)) {
                         if (settings.verbose > 0)
@@ -5587,6 +5600,7 @@ static void drive_machine(conn *c) {
                         break;
                     }
                 }
+                //退出
                 stop = true;
             }
             break;
@@ -5821,12 +5835,16 @@ static void drive_machine(conn *c) {
     return;
 }
 
+//由于 Memcache 采用 libevent 事件库来监听网络连接，只要有一个网络连接(文件描述符)有动作，都会马上回调 event_handler() 函数
+//可以从这个 event_handler() 函数开始，追踪一个 Set 命令内部经历了哪些流程
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
 
+    // 获取当前连接的 conn*
     c = (conn *)arg;
     assert(c != NULL);
 
+    // 保存一下当前触发 event 事件类型
     c->which = which;
 
     /* sanity */
@@ -5838,6 +5856,7 @@ void event_handler(const int fd, const short which, void *arg) {
     }
 
     //调用状态机函数
+    //状态机函数drive_machine(conn*) 根据 conn->state， 即连接当前的不同状态来做对应的处理。
     drive_machine(c);
 
     /* wait for next event */

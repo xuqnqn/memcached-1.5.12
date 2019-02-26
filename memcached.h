@@ -172,17 +172,24 @@ typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
  * Possible states of a connection.
  */
 enum conn_states {
-    conn_listening,  /**< the socket which listens for connections */
-    conn_new_cmd,    /**< Prepare connection for next command */
-    conn_waiting,    /**< waiting for a readable socket */
-    conn_read,       /**< reading in a command line */
-    conn_parse_cmd,  /**< try to parse a command from the input buffer */
-    conn_write,      /**< writing out a simple response */
-    conn_nread,      /**< reading in a fixed number of bytes */
+    /** 主线程 libevent 监听事件的回调状态,该连接状态只会赋给主
+        线程 libevent 监听的文件描述符 (11211) 也就说 conn->state=conn_listening
+        始终等于这个状态,由于主线程回调只会触发这一个状态,所以只要触发就代表有新的客户
+        端来连接, 就需要分发该连接到 work 线程并创建, 因为主线程不负责处理连接 , 只负
+        责分发连接 , 有点类似于负载均衡 */
+    conn_listening,  /**< the socket which listens for connections */       /** 连接分发创建状态 */
+
+    /** work线程 libevent 监听事件的回调状态 , 下面的这些状态全部都由 work 线程事件回调处理 */
+    conn_new_cmd,    /**< Prepare connection for next command */            /** 连接开始状态 */
+    conn_waiting,    /**< waiting for a readable socket */                  /** 等待连接有活动 */
+    conn_read,       /**< reading in a command line */                      /** 读取网路缓冲区数据到应用层buf缓冲区 */
+    conn_parse_cmd,  /**< try to parse a command from the input buffer */   /** 解析命令 */
+    conn_write,      /**< writing out a simple response */                  /** 添加一条response message*/
+    conn_nread,      /**< reading in a fixed number of bytes */             /** 从应用层缓存区读取数据 */
     conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
-    conn_closing,    /**< closing this connection */
-    conn_mwrite,     /**< writing out many items sequentially */
-    conn_closed,     /**< connection is closed */
+    conn_closing,    /**< closing this connection */                        /** 关闭一个连接 */
+    conn_mwrite,     /**< writing out many items sequentially */            /** 回写客户端数据 */
+    conn_closed,     /**< connection is closed */                           /** 异常进程关闭 */
     conn_watch,      /**< held by the logger thread as a watcher */
     conn_max_state   /**< Max state value (used for assertion) */
 };

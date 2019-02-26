@@ -493,6 +493,7 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     }
 
     //按顺序获取一个线程id
+    //memcached 给worker线程分配新连接的方法是：轮转方式
     int tid = (last_thread + 1) % settings.num_threads;
 
     //定位到该线程地址
@@ -509,6 +510,7 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     item->mode = queue_new_conn;
 
     //写入当前获取到的线程cq_item队列里面去
+    //即：把新连接写push到选中的worker线程的conn_queue里面去
     cq_push(thread->new_conn_queue, item);
 
     MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
