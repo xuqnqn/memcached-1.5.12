@@ -26,16 +26,17 @@ enum conn_queue_item_modes {
 };
 typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
-    int               sfd;
-    enum conn_states  init_state;
-    int               event_flags;
-    int               read_buffer_size;
-    enum network_transport     transport;
-    enum conn_queue_item_modes mode;
+    int               sfd;                  /* 文件描述符 */
+    enum conn_states  init_state;           /* 连接状态 */
+    int               event_flags;          /* 监听事件类型 EV_READ | EV_PERSIST */
+    int               read_buffer_size;     /* 每次缓冲区读取size */
+    enum network_transport     transport;   /* TCP 或 UDP */
+    enum conn_queue_item_modes mode;        /* 下一个 cq_item */
     conn *c;
     CQ_ITEM          *next;
 };
 
+//conn_queue 队列结构体，用于指向分配给自己 CQ_ITEM
 /* A connection queue. */
 typedef struct conn_queue CQ;
 struct conn_queue {
@@ -290,6 +291,7 @@ static void create_worker(void *(*func)(void *), void *arg) {
 
     pthread_attr_init(&attr);
 
+    // 创建线程，线程函数指针 func = worker_libevent 
     if ((ret = pthread_create(&((LIBEVENT_THREAD*)arg)->thread_id, &attr, func, arg)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n",
                 strerror(ret));
@@ -318,6 +320,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     me->base = event_base_new_with_config(ev_config);
     event_config_free(ev_config);
 #else
+    //初始化当前线程的event事件
     me->base = event_init();
 #endif
 
@@ -327,6 +330,9 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     }
 
     /* Listen for notifications from other threads */
+    /* 设置一个pipe管道监听事件，这就是上面说的，当有一个新的连接分配给
+       当前线程时，就会通知该文件描述符 me->notify_receive_fd 调用回调
+       函数 thread_libevent_process 参数就是 me 当前线程结构体指针 */
     event_set(&me->notify_event, me->notify_receive_fd,
               EV_READ | EV_PERSIST, thread_libevent_process, me);
     event_base_set(me->base, &me->notify_event);
@@ -336,11 +342,13 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(1);
     }
 
+    //创建一个连接队列
     me->new_conn_queue = malloc(sizeof(struct conn_queue));
     if (me->new_conn_queue == NULL) {
         perror("Failed to allocate memory for connection queue");
         exit(EXIT_FAILURE);
     }
+    //初始化连接队列
     cq_init(me->new_conn_queue);
 
     if (pthread_mutex_init(&me->stats.mutex, NULL) != 0) {
@@ -348,8 +356,8 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(EXIT_FAILURE);
     }
 
-    me->suffix_cache = cache_create("suffix", SUFFIX_SIZE, sizeof(char*),
-                                    NULL, NULL);
+    //创建一块 cache
+    me->suffix_cache = cache_create("suffix", SUFFIX_SIZE, sizeof(char*), NULL, NULL);
     if (me->suffix_cache == NULL) {
         fprintf(stderr, "Failed to create suffix cache\n");
         exit(EXIT_FAILURE);
@@ -384,6 +392,7 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
 
+    // 实际上就是进行 event_loop 开始监听每个线程事件
     event_base_loop(me->base, 0);
 
     event_base_free(me->base);
@@ -396,12 +405,13 @@ static void *worker_libevent(void *arg) {
  * input arrives on the libevent wakeup pipe.
  */
 static void thread_libevent_process(int fd, short which, void *arg) {
-    LIBEVENT_THREAD *me = arg;
+    LIBEVENT_THREAD *me = arg;  //对应的线程结构体指针，分配给那个线程，就是那个线程的指针
     CQ_ITEM *item;
     char buf[1];
     conn *c;
     unsigned int timeout_fd;
 
+    //读取一个字节，因为主线程有新连接分配给工作线程的时候，会往该工作线程的管道写入一个字符 'c'
     if (read(fd, buf, 1) != 1) {
         if (settings.verbose > 0)
             fprintf(stderr, "Can't read from libevent pipe\n");
@@ -410,13 +420,15 @@ static void thread_libevent_process(int fd, short which, void *arg) {
 
     switch (buf[0]) {
     case 'c':
-        item = cq_pop(me->new_conn_queue);
+        item = cq_pop(me->new_conn_queue);  // 从当前连接队列取出刚才主线程 dispatch_conn_new() 写入的 cq_item
 
         if (NULL == item) {
             break;
         }
         switch (item->mode) {
             case queue_new_conn:
+                // 创建一个网络连接，并往当前线程 me->base 加入一个监听事件 回调函数就是 event_handler -> drive_machine 
+                // 状态为 item->init_state = conn_new_cmd
                 c = conn_new(item->sfd, item->init_state, item->event_flags,
                                    item->read_buffer_size, item->transport,
                                    me->base);
@@ -432,6 +444,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
                         close(item->sfd);
                     }
                 } else {
+                    //将当前线程指针赋给c->thread字段
                     c->thread = me;
                 }
                 break;
@@ -440,6 +453,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
                 conn_worker_readd(item->c);
                 break;
         }
+        //释放item, 就是重新加入到空闲cq_item链表里面
         cqi_free(item);
         break;
     /* we were told to pause and report in */
@@ -468,6 +482,7 @@ static int last_thread = -1;
  */
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport) {
+    //从 cq_item 空闲链表获取一个
     CQ_ITEM *item = cqi_new();
     char buf[1];
     if (item == NULL) {
@@ -477,12 +492,15 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
         return ;
     }
 
+    //按顺序获取一个线程id
     int tid = (last_thread + 1) % settings.num_threads;
 
+    //定位到该线程地址
     LIBEVENT_THREAD *thread = threads + tid;
 
     last_thread = tid;
 
+    //将一些参数赋值给 cq_item 结构体
     item->sfd = sfd;
     item->init_state = init_state;
     item->event_flags = event_flags;
@@ -490,9 +508,12 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     item->transport = transport;
     item->mode = queue_new_conn;
 
+    //写入当前获取到的线程cq_item队列里面去
     cq_push(thread->new_conn_queue, item);
 
     MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
+    //写入一个字符 'c' 到当前获取的线程 (thread->notify_send_fd) 管道文件描述符里
+    //触发该线程监听事件并回调 thread_libevent_process 函数，最终完成新连接分配工作
     buf[0] = 'c';
     if (write(thread->notify_send_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
@@ -735,10 +756,14 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
  *
  * nthreads  Number of worker event handler threads to spawn
  */
+// 初始化线程函数
+// settings.num_threads 线程数
+// main_base 主进程事件
 void memcached_thread_init(int nthreads, void *arg) {
     int         i;
     int         power;
 
+    // 初始化锁
     for (i = 0; i < POWER_LARGEST; i++) {
         pthread_mutex_init(&lru_locks[i], NULL);
     }
@@ -751,6 +776,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     cqi_freelist = NULL;
 
     /* Want a wide lock table, but don't waste memory */
+    /* 根据线程数，设定hash表段锁的颗粒度 */
     if (nthreads < 3) {
         power = 10;
     } else if (nthreads < 4) {
@@ -766,6 +792,7 @@ void memcached_thread_init(int nthreads, void *arg) {
         power = 15;
     }
 
+    // 不能超过最大值 hashpower = 16
     if (power >= hashpower) {
         fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
         fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
@@ -773,24 +800,30 @@ void memcached_thread_init(int nthreads, void *arg) {
         exit(1);
     }
 
+    //hash表item锁数量
     item_lock_count = hashsize(power);
     item_lock_hashpower = power;
 
+    //申请item锁
     item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
     if (! item_locks) {
         perror("Can't allocate item locks");
         exit(1);
     }
+
+    //初始化item锁
     for (i = 0; i < item_lock_count; i++) {
         pthread_mutex_init(&item_locks[i], NULL);
     }
 
+    // 根据线程数，创建线程结构体
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
     if (! threads) {
         perror("Can't allocate thread descriptors");
         exit(1);
     }
 
+    // 根据线程数创建pipe管道，每个线程都监听自己管道的文件描述符
     for (i = 0; i < nthreads; i++) {
         int fds[2];
         if (pipe(fds)) {
@@ -798,22 +831,26 @@ void memcached_thread_init(int nthreads, void *arg) {
             exit(1);
         }
 
+        //读写 pipe fd
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
+        //设置线程监听事件及创建该线程连接队列等.
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
     }
 
     /* Create threads after we've done all the libevent setup. */
+    /* 开始创建线程 */
     for (i = 0; i < nthreads; i++) {
         create_worker(worker_libevent, &threads[i]);
     }
 
     /* Wait for all the threads to set themselves up before returning. */
+    /* 等待所有线程创建完毕之后，再返回 */
     pthread_mutex_lock(&init_lock);
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);

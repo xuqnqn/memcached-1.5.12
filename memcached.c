@@ -160,11 +160,16 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
 
     if (fd == -42 || allow_new_conns == false) {
         /* reschedule in 10ms if we need to keep polling */
+        //这里可以看到设置了一个定时器,每 10ms 回调一次当前函数
+        //直到 allow_new_conns = true 为止,因为等于 true 就代表
+        //已经有空闲文件描述符了,可以重新建立连接。
         evtimer_set(&maxconnsevent, maxconns_handler, 0);
         event_base_set(main_base, &maxconnsevent);
         evtimer_add(&maxconnsevent, &t);
     } else {
+        //删除定时器
         evtimer_del(&maxconnsevent);
+        //重新调用 accept_new_conns 这次参数 do_accept = true
         accept_new_conns(true);
     }
 }
@@ -423,8 +428,13 @@ static void conn_init(void) {
     int headroom = 10;      /* account for extra unexpected open FDs */
     struct rlimit rl;
 
+    // 默认最大连接数
+    // settings.maxconns 启动memcache的时候指定
     max_fds = settings.maxconns + headroom + next_fd;
 
+    // 先尝试获取系统进程最大打开文件描述符数
+    // 如果获取成功则按进程最大打开文件描述符
+    // 设置最大连接数
     /* But if possible, get the actual highest FD we can possibly ever see. */
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         max_fds = rl.rlim_max;
@@ -435,6 +445,7 @@ static void conn_init(void) {
 
     close(next_fd);
 
+    // 根据最大文件描述符数量，创建conn结构体指针数组
     if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
         /* This is unrecoverable so bail out early. */
@@ -499,6 +510,12 @@ void conn_worker_readd(conn *c) {
 #endif
 }
 
+// sfd              网络文件描述符
+// init_state       连接状态 (主线程创建的本机端口的默认连接状态都会是 conn_listening ) 就是代表只把新的连接分配到work线程，不作其它处理
+// event_flags      事件监听类型
+// read_buffer_size 读到缓冲区size
+// transport        TCP 、 UDP
+// base             主线程的 event 或者 work线程的 event
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
@@ -509,6 +526,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c = conns[sfd];
 
     if (NULL == c) {
+        // 创建一个conn结构体，并指向
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
             STATS_LOCK();
             stats.malloc_fails++;
@@ -518,6 +536,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
         MEMCACHED_CONN_CREATE(c);
 
+        // 初始化每个字段
         c->rbuf = c->wbuf = 0;
         c->ilist = 0;
         c->suffixlist = 0;
@@ -533,6 +552,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->msgsize = MSG_LIST_INITIAL;
         c->hdrsize = 0;
 
+        // 创建读写缓冲区
         c->rbuf = (char *)malloc((size_t)c->rsize);
         c->wbuf = (char *)malloc((size_t)c->wsize);
         c->ilist = (item **)malloc(sizeof(item *) * c->isize);
@@ -550,11 +570,14 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             return NULL;
         }
 
+        // 统计增加
         STATS_LOCK();
         stats_state.conn_structs++;
         STATS_UNLOCK();
 
+        // 保存当前网络文件描述符
         c->sfd = sfd;
+        // 指针保存到conns
         conns[sfd] = c;
     }
 
@@ -626,6 +649,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
+    // 设置监听事件，回调函数 event_handler 
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
@@ -806,16 +830,26 @@ static void conn_close(conn *c) {
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
+    //释放当前连接申请的一些资源数据
     conn_cleanup(c);
 
     MEMCACHED_CONN_RELEASE(c->sfd);
     conn_set_state(c, conn_closed);
+    //关闭连接
     close(c->sfd);
 
+    //添加一个conn_lock互斥锁,防止跟上面accept_new_conns函数
+    //同时操作 allow_new_conns 变量而冲突
     pthread_mutex_lock(&conn_lock);
+    //这里每次关闭一个文件描述符之后都会allow_new_conns = true
     allow_new_conns = true;
     pthread_mutex_unlock(&conn_lock);
 
+    //为什么不能同时操作 allow_new_conns 变量？
+    //因为上面函数会把这个变量置为false,然后根据false添加定时器,让服务器缓冲休息一下(等待更多的连接释放)
+    //但如果不加锁,可能会导致上面函数把这个变量置为false的同时这里把这个变量置为true了
+    //所以就导致上面函数判断这个变量等于false失败，所以也不会添加定时器了而且马上恢复服务器
+    //连接功能.
     STATS_LOCK();
     stats_state.curr_conns--;
     STATS_UNLOCK();
@@ -5204,15 +5238,20 @@ static bool update_event(conn *c, const int new_flags) {
 void do_accept_new_conns(const bool do_accept) {
     conn *next;
 
+    //本机绑定的端口也会使用conn结构体
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
+            //恢复当前绑定端口的文件描述符的事件
             update_event(next, EV_READ | EV_PERSIST);
+            //恢复当前socket连接队列最大限额 settings.backlog
             if (listen(next->sfd, settings.backlog) != 0) {
                 perror("listen");
             }
         }
         else {
+            //先暂时关闭当前绑定端口的文件描述符的事件
             update_event(next, 0);
+            //把当前socket连接队列最大限额置0，就是代表不再进行TCP三次握手.
             if (listen(next->sfd, 0) != 0) {
                 perror("listen");
             }
@@ -5223,6 +5262,7 @@ void do_accept_new_conns(const bool do_accept) {
         struct timeval maxconns_exited;
         uint64_t elapsed_us;
         gettimeofday(&maxconns_exited,NULL);
+        //统计信息
         STATS_LOCK();
         elapsed_us =
             (maxconns_exited.tv_sec - stats.maxconns_entered.tv_sec) * 1000000
@@ -5231,12 +5271,13 @@ void do_accept_new_conns(const bool do_accept) {
         stats_state.accepting_conns = true;
         STATS_UNLOCK();
     } else {
+        //统计信息
         STATS_LOCK();
         stats_state.accepting_conns = false;
         gettimeofday(&stats.maxconns_entered,NULL);
         stats.listen_disabled_num++;
         STATS_UNLOCK();
-        allow_new_conns = false;
+        allow_new_conns = false;    //代表当前不能进行新连接创建
         maxconns_handler(-42, 0, 0);
     }
 }
@@ -5391,6 +5432,8 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
+//drive_machine 状态机函数，就是根据连接的状态进行对应的处理
+//新连接创建默认的状态是 conn_listening
 static void drive_machine(conn *c) {
     bool stop = false;
     int sfd;
@@ -5407,10 +5450,11 @@ static void drive_machine(conn *c) {
 
     assert(c != NULL);
 
+    //循环处理conn连接
     while (!stop) {
 
         switch(c->state) {
-        case conn_listening:
+        case conn_listening:        //新连接分配状态
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
@@ -5419,6 +5463,7 @@ static void drive_machine(conn *c) {
                 sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
             }
 #else
+            //accept一个当前连接文件描述符
             sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
 #endif
             if (sfd == -1) {
@@ -5431,8 +5476,15 @@ static void drive_machine(conn *c) {
                     /* these are transient, so don't log anything */
                     stop = true;
                 } else if (errno == EMFILE) {
+                    //因为有可能并发量过大一瞬间导致大量的连接，超过了系统设置的最大文件描述符数量，
+                    //这个时候 memcache 实际上会拒绝连接的，这个拒绝连接是指拒绝TCP三次握手(减轻服
+                    //务器负担)，然后内部开启定时器不断的检查是否有可用的文件描述，当有可用的文件描
+                    //述符时，会在打开 socket上面在 accept 获取一个文件描述符如果返回 EMFILE 这个错
+                    //误代表文件描述符耗尽，然后执行 accept_new_conns(false)
                     if (settings.verbose > 0)
                         fprintf(stderr, "Too many open connections\n");
+                    //如果连接太多且文件描述符不够用，会先暂时拒绝连接请求
+                    //当有可用文件描述符时会打开，下面会说明此函数内部流程    
                     accept_new_conns(false);
                     stop = true;
                 } else {
@@ -5449,6 +5501,7 @@ static void drive_machine(conn *c) {
                 }
             }
 
+            //如果当前连接数大于启动时设定的最大连接数则报错
             if (settings.maxconns_fast &&
                 stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1) {
                 str = "ERROR Too many open connections\r\n";
@@ -5458,6 +5511,10 @@ static void drive_machine(conn *c) {
                 stats.rejected_conns++;
                 STATS_UNLOCK();
             } else {
+                //调度连接，选择那个work线程处理该连接
+                //选择完成之后，创建该连接的conn结构体
+                //默认状态为 conn_new_cmd 新命令然后继续监听
+                //再触发事件之后就会根据状态走下面的流程
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      DATA_BUFFER_SIZE, c->transport);
             }
@@ -5465,6 +5522,7 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
 
+        //这些状态就是分配完连接之后，在处理该连接时的状态流程。
         case conn_waiting:
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
@@ -5779,6 +5837,7 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
+    //调用状态机函数
     drive_machine(c);
 
     /* wait for next event */
@@ -6124,6 +6183,8 @@ static int server_socket_unix(const char *path, int access_mask) {
         close(sfd);
         return 1;
     }
+    //因为本机打开了一个端口产生了一个网络文件描述符，所以给改文件描述符创建一个 conn，
+    //并加入主线程 main_base 事件里面了，进行监听，处理新的连接分配工作
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
                                  local_transport, main_base))) {
@@ -7643,7 +7704,7 @@ int main (int argc, char **argv) {
     event_config_free(ev_config);
 #else
     /* Otherwise, use older API */
-    main_base = event_init();
+    main_base = event_init();   //主进程event事件初始化
 #endif
 
     /* initialize other stuff */
