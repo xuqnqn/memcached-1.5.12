@@ -150,15 +150,15 @@ extern "C"
      */
     typedef union {
         struct {
-            uint8_t magic;
-            uint8_t opcode;
-            uint16_t keylen;
-            uint8_t extlen;
+            uint8_t magic;      //二进制协议标示
+            uint8_t opcode;     //命令标示(get|set)
+            uint16_t keylen;    //key lenght
+            uint8_t extlen;     //过期时间、flag 占用字节数, 固定 8 字节
             uint8_t datatype;
-            uint16_t reserved;
-            uint32_t bodylen;
-            uint32_t opaque;
-            uint64_t cas;
+            uint16_t reserved;  //(保留未来使用)
+            uint32_t bodylen;   //value大小
+            uint32_t opaque;    //目前没看有什么用途(看源码就是直接保存一下,回写客户端的时候又给带回去了)
+            uint64_t cas;       // cas
         } request;
         uint8_t bytes[24];
     } protocol_binary_request_header;
@@ -268,6 +268,10 @@ extern "C"
      * Definition of the packet used by set, add and replace
      * See section 4
      */
+    // 二进制 set 命令完整协议
+    // 实际上就是在header基础上多了一个body结构体, 记录一下 flags 和 过期时间
+    // 这个结构体占用8个字节,也就是上面说的extlen, 也可以看到下
+    // 面bytes的总大小是在header的基础上+8
     typedef union {
         struct {
             protocol_binary_request_header header;

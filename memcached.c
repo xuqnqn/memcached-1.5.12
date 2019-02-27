@@ -1957,10 +1957,30 @@ static void process_bin_stat(conn *c) {
     }
 }
 
+//设置如何去读取key命令
 static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
     assert(c);
+    //当前key处理类型
     c->substate = next_substate;
+    //计算从buf缓冲区或网络缓冲区待读取的字节数(也就是读取 key + flags + expiration)
+    //因为有时候buf缓冲区数据不够则从网络缓冲区读取
     c->rlbytes = c->keylen + extra;
+
+    //判断buf缓冲区空间中是否已经可以容纳下待读取的rlbytes字节数
+    //大部分不会存在rlbytes容纳不下的情况, 因为每次发送过
+    //来都是一个完整的二进制包而rlbytes也都在这个包里面所
+    //以读取的时候也是完整的读取到buf缓冲区里面,也就是说buf缓冲
+    //区空间是根据发送数据多少动态调整的,最大调整(扩容)4次
+    
+    //除非极端情况比如:网络延迟,先到了一部分数据,还有一部分
+    //未到,这可能会导致我们的buf空间大小计算错误
+    //如 默认buf等于2048/Bytes,正常完整发送过来完整的包等于2050/Bytes
+    //   但是由于各种原因先发送过来 2046/Bytes, 如果按完整的包大小我们
+    //   的buf需要(调整扩容1次)以完全容纳下,但这不是一个完整的包只是部分
+    //   所以 2048 > 2046 没考虑扩容,但是当我们处理完包头2046/Bytes
+    //   需要在处理 c->rlbytes 字节的时候就会导致空间不足了,因为已经处理2046/Bytes
+    //   还需要处理4/Bytes, 但是buf只有2048-2046=2/Bytes, 但是我们需要4/Bytes, 所以就还要在
+    //   网络缓冲区中读取2/Bytes放到buf里面,但是buf空间不足,这就会导致命中下面这个条件 4 > 2048 - 2046
 
     /* Ok... do we have room for the extras and the key in the input buffer? */
     ptrdiff_t offset = c->rcurr + sizeof(protocol_binary_request_header) - c->rbuf;
@@ -2005,7 +2025,9 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
     }
 
     /* preserve the header in the buffer.. */
+    //把c->ritem指向buf中待读取的数据区
     c->ritem = c->rcurr + sizeof(protocol_binary_request_header);
+    //切换当前连接状态为conn_nread
     conn_set_state(c, conn_nread);
 }
 
@@ -2232,6 +2254,7 @@ static bool authenticated(conn *c) {
     return rv;
 }
 
+//根据命令的类型-设置如何读取
 static void dispatch_bin_command(conn *c) {
     int protocol_error = 0;
 
@@ -2255,14 +2278,16 @@ static void dispatch_bin_command(conn *c) {
     c->noreply = true;
 
     /* binprot supports 16bit keys, but internals are still 8bit */
+    /* 判断key的长度是否超过最大限制 */
     if (keylen > KEY_MAX_LENGTH) {
         handle_binary_protocol_error(c);
         return;
     }
 
     switch (c->cmd) {
+    //命中 PROTOCOL_BINARY_CMD_SETQ 类型
     case PROTOCOL_BINARY_CMD_SETQ:
-        c->cmd = PROTOCOL_BINARY_CMD_SET;
+        c->cmd = PROTOCOL_BINARY_CMD_SET;       //更新cmd至memcache内部set类型
         break;
     case PROTOCOL_BINARY_CMD_ADDQ:
         c->cmd = PROTOCOL_BINARY_CMD_ADD;
@@ -2329,10 +2354,12 @@ static void dispatch_bin_command(conn *c) {
                 protocol_error = 1;
             }
             break;
+        //命中 PROTOCOL_BINARY_CMD_SET 类型
         case PROTOCOL_BINARY_CMD_SET: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_ADD: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_REPLACE:
             if (extlen == 8 && keylen != 0 && bodylen >= (keylen + 8)) {
+                //设置读取key指令
                 bin_read_key(c, bin_reading_set_header, 8);
             } else {
                 protocol_error = 1;
@@ -2724,14 +2751,23 @@ static void complete_nread_binary(conn *c) {
 static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
+    
+    //如果c->item未释放,则重新释放下
     if(c->item != NULL) {
         item_remove(c->item);
         c->item = NULL;
     }
+
+    //重置下各个buf缓冲区大小,因为有时候发送大量的数据过来就会导致buf特别大
+    //当大到一个阀值,并且buf里面的数据处理的差不多了,就会收缩下内存
     conn_shrink(c);
+
+    //判断当前buf缓冲区是否还有数据，如果有则 conn_parse_cmd 解析命令
+    //如果没有则 conn_waiting 切换下状态, 重新监听事件等待下次回调
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
     } else {
+        // 由于第一次调用 c->rbytes 是空的还没有读取进来所以直接
         conn_set_state(c, conn_waiting);
     }
 }
@@ -4980,9 +5016,12 @@ static int try_read_command(conn *c) {
     assert(c->rbytes > 0);
 
     if (c->protocol == negotiating_prot || c->transport == udp_transport)  {
+        //判断当前buf缓冲区第一个字符是否等于 PROTOCOL_BINARY_REQ = 0x80
         if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
+            //二进制包
             c->protocol = binary_prot;
         } else {
+            //ASCII包
             c->protocol = ascii_prot;
         }
 
@@ -4992,9 +5031,14 @@ static int try_read_command(conn *c) {
         }
     }
 
+    //判断是否等于 二进制包
     if (c->protocol == binary_prot) {
         /* Do we have the complete packet header? */
+        /* 判断当前buf缓冲区的数据大小是否小于默认包头的大小 */
         if (c->rbytes < sizeof(c->binary_header)) {
+            //如果小于包头则不能处理当前数据
+            //返回0 继续事件监听等待读取完整
+            //的数据在进行处理
             /* need more data! */
             return 0;
         } else {
@@ -5008,6 +5052,7 @@ static int try_read_command(conn *c) {
                 }
             }
 #endif
+            //把rcurr指向buf缓冲区位置的数据转换成 protocol_binary_request_header 包头结构体
             protocol_binary_request_header* req;
             req = (protocol_binary_request_header*)c->rcurr;
 
@@ -5024,11 +5069,13 @@ static int try_read_command(conn *c) {
                 fprintf(stderr, "\n");
             }
 
+            //整理数据
             c->binary_header = *req;
             c->binary_header.request.keylen = ntohs(req->request.keylen);
             c->binary_header.request.bodylen = ntohl(req->request.bodylen);
             c->binary_header.request.cas = ntohll(req->request.cas);
 
+            //还是判断第一个字符是否不等于 0x80
             if (c->binary_header.request.magic != PROTOCOL_BINARY_REQ) {
                 if (settings.verbose) {
                     fprintf(stderr, "Invalid magic:  %x\n",
@@ -5047,15 +5094,19 @@ static int try_read_command(conn *c) {
                 return 0;
             }
 
+            //命令opcode获取
             c->cmd = c->binary_header.request.opcode;
             c->keylen = c->binary_header.request.keylen;
             c->opaque = c->binary_header.request.opaque;
             /* clear the returned cas value */
             c->cas = 0;
 
+            //根据命令的类型设置读取命令指令
             dispatch_bin_command(c);
 
+            //更新一下buf缓冲区剩余数据大小
             c->rbytes -= sizeof(c->binary_header);
+            //更新一下buf缓冲区当前处理位置
             c->rcurr += sizeof(c->binary_header);
         }
     } else {
@@ -5156,24 +5207,33 @@ static enum try_read_result try_read_udp(conn *c) {
  *
  * @return enum try_read_result
  */
+//读取网络缓冲区数据
 static enum try_read_result try_read_network(conn *c) {
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
     int num_allocs = 0;
     assert(c != NULL);
 
+    //判断当前连接buf缓冲区读取的位置在不在起始
     if (c->rcurr != c->rbuf) {
         if (c->rbytes != 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
         c->rcurr = c->rbuf;
     }
 
+    // 循环读取,两种情况
+    // 第一种从网络缓冲区读取的数据小于当前连接buf缓冲区剩余的大小, 则代表读取完毕, 直接 brek
+    // 第二种从网络缓冲区读取的数据等于当前连接buf缓冲区剩余的大小, 则代表网络缓冲区可能还有数据
+    // 未读取完毕, 则扩充一下当前连接buf缓冲区的大小, 继续读取, 最大扩充 4 次
     while (1) {
+        //判断读取到的数据大小是否正好等于当前连接buf缓冲区大小
         if (c->rbytes >= c->rsize) {
+            // 判断是否已经扩充了 4 次
             if (num_allocs == 4) {
                 return gotdata;
             }
             ++num_allocs;
+            //扩容
             char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
             if (!new_rbuf) {
                 STATS_LOCK();
@@ -5182,23 +5242,29 @@ static enum try_read_result try_read_network(conn *c) {
                 if (settings.verbose > 0) {
                     fprintf(stderr, "Couldn't realloc input buffer\n");
                 }
+                //当前读取的大小置0
                 c->rbytes = 0; /* ignore what we read */
                 out_of_memory(c, "SERVER_ERROR out of memory reading request");
                 c->write_and_go = conn_closing;
                 return READ_MEMORY_ERROR;
             }
             c->rcurr = c->rbuf = new_rbuf;
+            //更新buf缓冲区大小
             c->rsize *= 2;
         }
 
+        //计算当前buf缓冲区剩余大小avail
         int avail = c->rsize - c->rbytes;
+        //读取 avail 个字节
         res = read(c->sfd, c->rbuf + c->rbytes, avail);
         if (res > 0) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_read += res;
             pthread_mutex_unlock(&c->thread->stats.mutex);
             gotdata = READ_DATA_RECEIVED;
+            //更新当前已读取大小
             c->rbytes += res;
+            //判断读取的字节是否正好等于buf缓冲区剩余的大小
             if (res == avail) {
                 continue;
             } else {
@@ -5524,6 +5590,8 @@ static void drive_machine(conn *c) {
 
         //这些状态就是分配完连接之后，在处理该连接时的状态流程。
         case conn_waiting:
+            // 更新当前事件类型为 EV_READ , 当流转到当前状态时, 就代表需要重新监听可读事件
+            // 主要是防止上面可能存在更新 EV_WRITE 情况, 所以就是在切换回来
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
                     fprintf(stderr, "Couldn't update event\n");
@@ -5531,30 +5599,50 @@ static void drive_machine(conn *c) {
                 break;
             }
 
+            // 更新状态为 conn_read , 就是下次在回调本函数, 直接找 coon_read 状态处理 , 其实也就是
+            // 开始读取网络缓冲区数据
             conn_set_state(c, conn_read);
             stop = true;
             break;
 
         case conn_read:
+            //判断当前是UDP还是TCP,以TCP为例调用 try_read_network 读网络缓冲区数据
             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
+            //如果没有数据则返回此状态,但是几乎不会返回该状态
+            //因为只要事件回调并调用conn_read状态就代表网络缓
+            //冲区有数据
             case READ_NO_DATA_RECEIVED:
+                //置为conn_waiting重新监听该连接
                 conn_set_state(c, conn_waiting);
                 break;
+            //成功读取
             case READ_DATA_RECEIVED:
+                //置为conn_parse_cmd状态解析命令
                 conn_set_state(c, conn_parse_cmd);
                 break;
+            //读取失败    
             case READ_ERROR:
+                //置为 conn_closing 关闭连接
                 conn_set_state(c, conn_closing);
                 break;
+            //扩充当前连接的buf缓冲区失败，就是申请内存失败    
             case READ_MEMORY_ERROR: /* Failed to allocate more memory */
                 /* State already set by try_read_network */
+                //继续再读取, 因为刚才扩充失败, 所以导致新读取的数据会覆盖buf缓冲区已有的
                 break;
             }
             break;
 
         case conn_parse_cmd :
+            //对刚才读取到连接buf缓冲区里面的数据进行解析
+            //如果是 二进制包 则解析包头
+            //如果是 ASCII包  则解析命令
+            //
+            //memcache 的数据包分为 二进制 、 ASCII 两种类型，目前大部分使用的都是 ASCII 类型数据包，
+            //拿PHP扩展 memcached 来说, 它支持 ASCII/二进制 两种类型协议，默认使用的是 ASCII协议
+            //ASCII 协议：  set <key><flags><exptime><bytes><casunique> [noreply]\r\n<datablock>\r\n
             if (try_read_command(c) == 0) {
                 /* wee need more data! */
                 conn_set_state(c, conn_waiting);
@@ -5592,6 +5680,16 @@ static void drive_machine(conn *c) {
                         把当前连接事件变成 EV_WRITE , 因为当前连接的(写)网络缓冲区没有数据,
                         从而达到低于等于最低水位, 重新触发事件, 继续回调本函数, 进行处理buf剩
                         余的数据包
+                        因为当前连接事件是 EV_READ , 当然我们可以不变成 EV_WRITE , 直接退出, 
+                        交由其他连接事件处理并等待下次回调即可,但是如果我们的(读)网络缓冲区一
+                        直没有数据，无法触发读回调，而应用缓冲区buf里面还有上次未处理的数据包，
+                        岂不是一直无法处理数据，对于客户端来说短时间内相当于丢失了一条命令,而
+                        变成 EV_WRITE 的话, 既可以保证直接退出，交由其他事件处理，又可以保证马
+                        上重新触发写事件，因为我们的写缓冲区没有数据，低于缓冲区最低水位(具体
+                        可以看一下网络缓冲区水位介绍), 所以保证马上又会触发事件回调 , 继续处理
+                        缓冲区buf未处理完的数据,说得简单点就相当于, 先让出队伍第一的位置, 重新
+                        到后面排队, 先让别的着急的人处理 , 一会排到我了在继续处理, 保证能把未
+                        处理完的给处理了.
                     */
                     if (!update_event(c, EV_WRITE | EV_PERSIST)) {
                         if (settings.verbose > 0)
@@ -5606,7 +5704,9 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_nread:
+            //是否已经把 rlbytes 读取完
             if (c->rlbytes == 0) {
+                //处理key或value
                 complete_nread(c);
                 break;
             }
@@ -5623,20 +5723,42 @@ static void drive_machine(conn *c) {
             if (!c->item || (((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) {
                 /* first check if we have leftovers in the conn_read buffer */
                 if (c->rbytes > 0) {
+                    //判断buf缓冲区剩余的rbytes是否大于或小于rlbytes然后计算出tocpoy
+                    //举个例子：
+                    //如果 rbytes=2、rlbytes=4 那么判断条件 tocopy = 2 > 4 ? 4 : 2;
+                    //所以 tocopy=2 也就是说buf缓冲区中已经存在 2/Bytes , 先把buf缓冲区中
+                    //这2/Bytes更新掉,再去网络缓冲区把剩下的2/Bytes读取进来,相反如果
+                    //rbytes > rlbytes 那就不需要再去网络缓冲区读取了,因为我们当前的
+                    //buf中已经存在了.
+                    //tocopy就是rlbytes在buf缓冲区已经存在的字节数
                     int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
+
+                    //如果 ritem != rcurr 就会把 rcurr 指向的区域数据copy到 ritem 地址里面
+                    //正常 ritem == rcurr 都是指向buf区域
+                    //出现这种情况一般是处理key的时候已经申请完毕item内存块,然后准备读取最终的
+                    //value这个时候会把ritem改成指向已申请的item数据区,然后执行到这步,直接把buf中
+                    //rcurr指向的数据copy到ritem指向的item数据区.
                     if (c->ritem != c->rcurr) {
                         memmove(c->ritem, c->rcurr, tocopy);
                     }
+                    //按topcopy更新
                     c->ritem += tocopy;
                     c->rlbytes -= tocopy;
                     c->rcurr += tocopy;
                     c->rbytes -= tocopy;
+
+                    //判断更新完rlbytes是否等于0,如果等于0就代表 tocopy 等于 rlbytes
+                    //也就是说rlbytes已经完整的存在buf缓冲区里面了
                     if (c->rlbytes == 0) {
-                        break;
+                        break;      /* 读取完毕break 执行调用上面的 complete_nread() 函数 */
                     }
                 }
 
                 /*  now try reading from the socket */
+
+                //上面条件如果rlbytes不等于0,就代表 tocopy 小于 rlbytes
+                //也就说buf缓冲区只存在一部分,还剩一部分需要去网络缓冲区里
+                //面在把 c->rbytes -= tocopy 剩余读取进来
                 res = read(c->sfd, c->ritem, c->rlbytes);
                 if (res > 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
@@ -5647,7 +5769,7 @@ static void drive_machine(conn *c) {
                     }
                     c->ritem += res;
                     c->rlbytes -= res;
-                    break;
+                    break;  /* 读取完毕break 执行调用上面的 complete_nread() 函数 */
                 }
             } else {
                 res = read_into_chunked_item(c);
@@ -5655,6 +5777,7 @@ static void drive_machine(conn *c) {
                     break;
             }
 
+            //下面就是一些读取失败的判断条件
             if (res == 0) { /* end of stream */
                 conn_set_state(c, conn_closing);
                 break;
