@@ -190,12 +190,16 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
      * occasional OOM's, rather than internally work around them.
      * This also gives one fewer code path for slab alloc/free
      */
+    //循环申请内存块,如果申请失败,继续循环申请最多10次
+    //如果在id对应的区域没有可用的内存块item，会去LRU
+    //队列逐出一个.
     for (i = 0; i < 10; i++) {
         uint64_t total_bytes;
         /* Try to reclaim memory first */
         if (!settings.lru_segmented) {
             lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
         }
+        //去id指定的区域获取一个空闲的item内存块
         it = slabs_alloc(ntotal, id, &total_bytes, 0);
 
         if (settings.temp_lru)
@@ -263,11 +267,16 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     if (nbytes < 2)
         return 0;
 
+    //计算需要申请内存总大小
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+    //判断是否开启cas如果开启cas那么就在ntotal基础上再加上
+    //存放cas信息的大小,一般是8/Bytes
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);
     }
 
+    //根据要申请的内存块大小找到对应的区域id,之前也说过memcache内存是按不同大小
+    //的区域进行划分的.
     unsigned int id = slabs_clsid(ntotal);
     unsigned int hdr_id = 0;
     if (id == 0)
@@ -301,6 +310,28 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         it = do_item_alloc_pull(ntotal, id);
     }
 
+      //如果等于NULL代表没有空闲的item则去LRU队列逐出一个
+        //这里的 LRU 队列分为两种情况
+        
+        //第一种情况开启 lru_maintainer_thread 线程
+        //会维护4个队列:
+        /*  id  => NOEXP_LRU 永不淘汰LRU队列,过期时间等于0会放在该队列
+            id  => HOT_LRU   新添加数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
+            id  => WARM_LRU  冷数据变为热数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
+            id  => COLD_LRU  冷数据LRU队列,如get访问的是此队列中最后一个元素，在lru线程
+                             维护此队列的时候会挪到WARM_LRU队列中,因为是最后一个元素,不
+                             挪走的话,有可能最先被逐出 
+                             而 HOT_LRU 和 WARM_LRU 队列中如果访问的是最后一个元素
+                             则会被挪到各自的队列头*/
+
+        //可以看到每个区域id都对应一条LRU队列 ,那么这个LRU队列也就代表只保存该区域id的item指针.
+        //HOT_LRU|WARM_LRU : 队列逐出的时候会去队列尾部看看是否有过期的数据如果有则淘汰,没有则不淘汰
+        //COLD_LRU : 队列逐出的时候会去尾部看看是否有过期的数据如果有则淘汰,如果没有也会淘汰.
+        
+        //第二种情况不开启 lru_maintainer_thread 线程
+        //id    =>  COLD_LRU  按照使用已使用item顺序先后加在该队列里面,头部最新使用的item,尾部最旧使用的item
+        //COLD_LRU : 队列逐出原则,就是从尾部依次淘汰跟上面原则一样.
+        //
     if (it == NULL) {
         pthread_mutex_lock(&lru_locks[id]);
         itemstats[id].outofmemory++;
@@ -317,6 +348,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     /* Items are initially loaded into the HOT_LRU. This is '0' but I want at
      * least a note here. Compiler (hopefully?) optimizes this out.
      */
+    //判断当前获取item加在那条LRU队列上
     if (settings.temp_lru &&
             exptime - current_time <= settings.temporary_ttl) {
         id |= TEMP_LRU;
@@ -326,19 +358,28 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         /* There is only COLD in compat-mode */
         id |= COLD_LRU;
     }
+    //保存一下id，这个id是对应LRU队列的索引位置.
     it->slabs_clsid = id;
 
     DEBUG_REFCNT(it, '*');
     it->it_flags |= settings.use_cas ? ITEM_CAS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
+    //把key copy到item->data里面
     memcpy(ITEM_key(it), key, nkey);
+    /*
+    #define ITEM_key(item) (((char*)&((item)->data)) \
+            + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+    */
+    //保存下过期时间
     it->exptime = exptime;
     if (settings.inline_ascii_response) {
+        //后缀copy到item->data里面,这个后缀suffix就是 flags + vlen 的字符串
         memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     } else if (nsuffix > 0) {
         memcpy(ITEM_suffix(it), &flags, sizeof(flags));
     }
+    //后缀长度
     it->nsuffix = nsuffix;
 
     /* Initialize internal chunk. */

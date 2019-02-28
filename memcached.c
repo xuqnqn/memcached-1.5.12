@@ -186,6 +186,9 @@ static rel_time_t realtime(const time_t exptime) {
 
     if (exptime == 0) return 0; /* 0 means never expire */
 
+    //如果想保存30天以上则需要传递绝对时间戳，如果不传递绝对时间戳而是30天的秒数则会导致马上过期
+    //如果不保存30天以上则直接传递过期秒数即可
+    /** #define REALTIME_MAXDELTA 60*60*24*30 */
     if (exptime > REALTIME_MAXDELTA) {
         /* if item expiration is at/before the server started, give it an
            expiration time of 1 second after the server started.
@@ -193,12 +196,41 @@ static rel_time_t realtime(const time_t exptime) {
            underflow and wrap around to some large value way in the
            future, effectively making items expiring in the past
            really expiring never */
+        //如果小于服务器启动时间戳则马上过期 
         if (exptime <= process_started)
             return (rel_time_t)1;
+        //客户端传递的绝对时间戳减去服务器的启动时间戳计算出过期时间    
         return (rel_time_t)(exptime - process_started);
     } else {
+        //客户端传递的过期秒数加上服务器的相对时间秒数计算出过期时间
         return (rel_time_t)(exptime + current_time);
     }
+    //举个例子:
+    // process_started : 服务器启动时间戳 1477929600
+    // current_time ：服务器相对时间,就是相对于启动到现在共过了多少秒,每秒+1.
+    
+    //（1） 保存30天以下的过期时间计算:
+    //      current_time = 10000  服务器当前相对时间
+    //      exptime = 3600        客户端要求3600秒之后过期
+    //    过期时间 = current_time +　exptime = 13600 
+    
+    //（2） 保存30天以上的过期时间计算:
+    //      current_time = 10000  服务器当前相对时间
+    //      process_started = 1477929600 服务器启动时间
+    //      当前服务器的绝对时间 = process_started + current_time  启动时间 + 相对时间
+    //      当前客户端的绝对时间 === 当前服务器的绝对时间
+    
+    //      exptime = time() + 2678400 = 1480618000  客户端按当前的绝对时间向后加上30天
+                      
+    //      过期时间 = exptime - process_started = 2688400
+    //               = (process_started + current_time + 2678400) - process_started
+    //             = current_time + 2678400 
+    
+    //      可以看出来实际上还是相对于 current_time 加上了 2678400 秒,所以就是通过绝对时间计算出相对时间
+    //      但是这种情况要保证客户端的时间和服务器的时间一致,不然的话会导致计算错误情况。
+    
+
+    //一般采用相对时间比较准,因为永远都是相对于服务器当前时间往后加sec    
 }
 
 static void stats_init(void) {
@@ -2451,22 +2483,29 @@ static void dispatch_bin_command(conn *c) {
         handle_binary_protocol_error(c);
 }
 
+//c->rcurr 目前指向缓冲区[buf]的位置为 header + extra(8) + key + (rcurr)value 
+//可以看到目前指向value的位置，记住当前位置，下面会根据 c->rcurr 计算出 header、key、等位置
 static void process_bin_update(conn *c) {
     char *key;
     int nkey;
     int vlen;
     item *it;
+    //获取当前包头指针并转成set包类型,因为set包里面有flags和过期时间expiration
+    //就是之前在header包后面跟着那8个字节
     protocol_binary_request_set* req = binary_get_request(c);
 
     assert(c != NULL);
 
+    //获取key
     key = binary_get_key(c);
+    //key的长度
     nkey = c->binary_header.request.keylen;
 
     /* fix byteorder in the request */
     req->message.body.flags = ntohl(req->message.body.flags);
     req->message.body.expiration = ntohl(req->message.body.expiration);
 
+    //value的长度
     vlen = c->binary_header.request.bodylen - (nkey + c->binary_header.request.extlen);
 
     if (settings.verbose > 1) {
@@ -2490,8 +2529,11 @@ static void process_bin_update(conn *c) {
         stats_prefix_record_set(key, nkey);
     }
 
+    //申请一块item内存块存放数据
     it = item_alloc(key, nkey, req->message.body.flags,
             realtime(req->message.body.expiration), vlen+2);
+    //上面的realtime函数,该函数负责将客户端传递的过期时间(sec)
+    //生成一个相对服务器的过期时间
 
     if (it == 0) {
         enum store_item_type status;
@@ -2525,6 +2567,7 @@ static void process_bin_update(conn *c) {
         return;
     }
 
+    //设置cas,如果客户端传递的话.
     ITEM_set_cas(it, c->binary_header.request.cas);
 
     switch (c->cmd) {
@@ -2541,6 +2584,10 @@ static void process_bin_update(conn *c) {
             assert(0);
     }
 
+    //判断当前的item否已经有cas了,如果有则 cmd = NREAD_CAS
+    //在处理value的时候会进行cas判断,判断当前item->data->cas
+    //是否等于之前的item->data->cas,这也是memcache在处理并发操作
+    //同一个item的解决方案.
     if (ITEM_get_cas(it) != 0) {
         c->cmd = NREAD_CAS;
     }
@@ -2553,10 +2600,14 @@ static void process_bin_update(conn *c) {
         c->ritem = ITEM_data(it);
     }
 #else
+    //c->ritem改成指向item数据区,上面在状态 conn_nread 里面也有提到这个点.
     c->ritem = ITEM_data(it);
 #endif
+    //待读取value的总长度
     c->rlbytes = vlen;
+    //更新当前连接处理下一步状态为 conn_nread
     conn_set_state(c, conn_nread);
+    //处理数据下一步状态为 bin_read_set_value
     c->substate = bin_read_set_value;
 }
 
@@ -2708,16 +2759,21 @@ static void complete_nread_binary(conn *c) {
     assert(c != NULL);
     assert(c->cmd >= 0);
 
+    //根据 c->substate 状态选择对应的函数处理
+    //之前在调用 bin_read_key(c, bin_reading_set_header, 8)
+    //这个函数的时候已经赋值了 c->substate = bin_reading_set_header
     switch(c->substate) {
     case bin_reading_set_header:
         if (c->cmd == PROTOCOL_BINARY_CMD_APPEND ||
                 c->cmd == PROTOCOL_BINARY_CMD_PREPEND) {
             process_bin_append_prepend(c);
         } else {
+            //(1) 执行 key 处理
             process_bin_update(c);
         }
         break;
     case bin_read_set_value:
+        //(2) 执行 value 处理
         complete_update_bin(c);
         break;
     case bin_reading_get_key:
@@ -2777,6 +2833,8 @@ static void complete_nread(conn *c) {
     assert(c->protocol == ascii_prot
            || c->protocol == binary_prot);
 
+    //还是判断当前的数据包是 ASCII 还是 binary_prot
+    //我们是二进制包
     if (c->protocol == ascii_prot) {
         complete_nread_ascii(c);
     } else if (c->protocol == binary_prot) {
