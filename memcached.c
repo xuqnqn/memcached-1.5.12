@@ -1562,6 +1562,7 @@ static void complete_update_bin(conn *c) {
     enum store_item_type ret = NOT_STORED;
     assert(c != NULL);
 
+    //c->item 就是我们申请item地址
     item *it = c->item;
 
     pthread_mutex_lock(&c->thread->stats.mutex);
@@ -1571,6 +1572,8 @@ static void complete_update_bin(conn *c) {
     /* We don't actually receive the trailing two characters in the bin
      * protocol, so we're going to just set them here */
     if ((it->it_flags & ITEM_CHUNKED) == 0) {
+        //给item->data里面的 value 部分结尾加上\r\n
+        //在上面item_alloc()函数参数vlen+2已经预留出来2个字节空间了
         *(ITEM_data(it) + it->nbytes - 2) = '\r';
         *(ITEM_data(it) + it->nbytes - 1) = '\n';
     } else {
@@ -1584,6 +1587,7 @@ static void complete_update_bin(conn *c) {
         ch->used += 2;
     }
 
+    //处理 value
     ret = store_item(it, c->cmd, c);
 
 #ifdef ENABLE_DTRACE
@@ -1636,6 +1640,8 @@ static void complete_update_bin(conn *c) {
         write_bin_error(c, eno, NULL, 0);
     }
 
+    //解除item引用
+    //因为无论是get还是set都会对 item->refcount++，这里会在 item->refcount--
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
 }
@@ -2529,9 +2535,9 @@ static void process_bin_update(conn *c) {
         stats_prefix_record_set(key, nkey);
     }
 
-    //申请一块item内存块存放数据
+    //申请一块item内存块存放数据 
     it = item_alloc(key, nkey, req->message.body.flags,
-            realtime(req->message.body.expiration), vlen+2);
+            realtime(req->message.body.expiration), vlen+2);    //   ======>　有很多内容
     //上面的realtime函数,该函数负责将客户端传递的过期时间(sec)
     //生成一个相对服务器的过期时间
 
@@ -2609,6 +2615,13 @@ static void process_bin_update(conn *c) {
     conn_set_state(c, conn_nread);
     //处理数据下一步状态为 bin_read_set_value
     c->substate = bin_read_set_value;
+
+    //经过上述步骤处理, 已经根据发送过来的协议包, 申请完item内存块了, 并做了一些处理, 剩下的部分就是
+    //(1) buf缓冲区或者网络缓冲区里面的value部分复制到item数据区
+    //(2) item地址通过当前key添加到hash表里
+    //(3) item加入LRU队列,就是一个链表记录已使用的item
+    //process_bin_update（） 函数处理完 key , 会把连接状态又更新成 conn_nread 然后还是调用 
+    //complete_nread() -> complete_nread_binary() -> case:bin_read_set_value(状态) => complete_update_bin()
 }
 
 static void process_bin_append_prepend(conn *c) {
@@ -2946,14 +2959,24 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
  *
  * Returns the state of storage.
  */
+
+//memcache 在每次 set 的时候都会新获取一个item，然后再把原来的item删除，不会直接在
+//原来的基础上修改，因为有可能这次发送的数据size要比第一次的大，如果直接在原来的基
+//础上肯定装不下，所以每次都根据数据包size重新选择一块item。
+//
 enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
+    //获取key
     char *key = ITEM_key(it);
+    //通过key获取原来的item 如果存在的话
     item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
+    //默认返回类型
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
     uint32_t flags;
 
+    //这个是add命令类型,可以看到如果是add命令，则不会更新到新的item
+    //只是更新一下原来item的时间而已
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
         do_item_update(old_it);
@@ -2961,8 +2984,10 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
         /* replace only replaces an existing value; don't store */
+        //这个是CAS如果开启了cas则会走这步代码
     } else if (comm == NREAD_CAS) {
         /* validate cas operation */
+        //如果old_it等于null，则不需要cas对比
         if(old_it == NULL) {
             // LRU expired
             stored = NOT_FOUND;
@@ -2970,6 +2995,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             c->thread->stats.cas_misses++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
         }
+        //判断当前item的cas是否等于之前的cas，为了保证数据的一致性
         else if (ITEM_get_cas(it) == ITEM_get_cas(old_it)) {
             // cas validates
             // it and old_it may belong to different classes.
@@ -2979,9 +3005,11 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             STORAGE_delete(c->thread->storage, old_it);
+            //如果cas对比一样则更新到新的item
             item_replace(old_it, it, hv);
             stored = STORED;
         } else {
+            //如果cas对比不一样则返回错误
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -3037,11 +3065,13 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             }
         }
 
+        //如果是Set命令,并且没有开启cas则会走下面这块代码
         if (stored == NOT_STORED && failed_alloc == 0) {
             if (old_it != NULL) {
                 STORAGE_delete(c->thread->storage, old_it);
                 item_replace(old_it, it, hv);
             } else {
+                //执行
                 do_item_link(it, hv);
             }
 

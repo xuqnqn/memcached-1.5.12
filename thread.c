@@ -666,13 +666,19 @@ enum delta_result_type add_delta(conn *c, const char *key,
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
+
 enum store_item_type store_item(item *item, int comm, conn* c) {
     enum store_item_type ret;
     uint32_t hv;
 
+    //获取key对应的hash值
     hv = hash(ITEM_key(item), item->nkey);
+
+    //只要有对key操作的地方都要加锁，防止多个请求同时操作一个key
+    //加锁
     item_lock(hv);
     ret = do_store_item(item, comm, c, hv);
+    //解锁
     item_unlock(hv);
     return ret;
 }

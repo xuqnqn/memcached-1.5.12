@@ -170,6 +170,7 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
                      char *suffix, uint8_t *nsuffix) {
     if (settings.inline_ascii_response) {
         /* suffix is defined at 40 chars elsewhere.. */
+        //后缀大小计算
         *nsuffix = (uint8_t) snprintf(suffix, 40, " %u %d\r\n", flags, nbytes - 2);
     } else {
         if (flags == 0) {
@@ -178,6 +179,7 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
             *nsuffix = sizeof(flags);
         }
     }
+    //这里看到每次申请内存大小并不是按照key+value,还会有一些额外的信息
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
@@ -206,6 +208,29 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
             total_bytes -= temp_lru_size(id);
 
         if (it == NULL) {
+        //如果等于NULL代表没有空闲的item则去LRU队列逐出一个
+        //这里的 LRU 队列分为两种情况
+
+            
+        //第一种情况开启 lru_maintainer_thread 线程
+        //会维护4个队列:
+        /*  id  => NOEXP_LRU 永不淘汰LRU队列,过期时间等于0会放在该队列
+            id  => HOT_LRU   新添加数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
+            id  => WARM_LRU  冷数据变为热数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
+            id  => COLD_LRU  冷数据LRU队列,如get访问的是此队列中最后一个元素，在lru线程
+                             维护此队列的时候会挪到WARM_LRU队列中,因为是最后一个元素,不
+                             挪走的话,有可能最先被逐出 
+                             而 HOT_LRU 和 WARM_LRU 队列中如果访问的是最后一个元素
+                             则会被挪到各自的队列头*/
+        
+        //可以看到每个区域id都对应一条LRU队列 ,那么这个LRU队列也就代表只保存该区域id的item指针.
+        //HOT_LRU|WARM_LRU : 队列逐出的时候会去队列尾部看看是否有过期的数据如果有则淘汰,没有则不淘汰
+        //COLD_LRU : 队列逐出的时候会去尾部看看是否有过期的数据如果有则淘汰,如果没有也会淘汰.
+        
+        //第二种情况不开启 lru_maintainer_thread 线程
+        //id    =>  COLD_LRU  按照使用已使用item顺序先后加在该队列里面,头部最新使用的item,尾部最旧使用的item
+        //COLD_LRU : 队列逐出原则,就是从尾部依次淘汰跟上面原则一样.
+    
             if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
                 if (settings.lru_segmented) {
                     lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
@@ -302,36 +327,14 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         }
 #endif
         hdr_id = slabs_clsid(htotal);
-        it = do_item_alloc_pull(htotal, hdr_id);
+        it = do_item_alloc_pull(htotal, hdr_id);    //去id指定的区域获取一个空闲的item内存块
         /* setting ITEM_CHUNKED is fine here because we aren't LINKED yet. */
         if (it != NULL)
             it->it_flags |= ITEM_CHUNKED;
     } else {
-        it = do_item_alloc_pull(ntotal, id);
+        it = do_item_alloc_pull(ntotal, id);        //去id指定的区域获取一个空闲的item内存块
     }
 
-      //如果等于NULL代表没有空闲的item则去LRU队列逐出一个
-        //这里的 LRU 队列分为两种情况
-        
-        //第一种情况开启 lru_maintainer_thread 线程
-        //会维护4个队列:
-        /*  id  => NOEXP_LRU 永不淘汰LRU队列,过期时间等于0会放在该队列
-            id  => HOT_LRU   新添加数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
-            id  => WARM_LRU  冷数据变为热数据LRU队列,如果大于指定的数量则挪到COLD_LRU队列
-            id  => COLD_LRU  冷数据LRU队列,如get访问的是此队列中最后一个元素，在lru线程
-                             维护此队列的时候会挪到WARM_LRU队列中,因为是最后一个元素,不
-                             挪走的话,有可能最先被逐出 
-                             而 HOT_LRU 和 WARM_LRU 队列中如果访问的是最后一个元素
-                             则会被挪到各自的队列头*/
-
-        //可以看到每个区域id都对应一条LRU队列 ,那么这个LRU队列也就代表只保存该区域id的item指针.
-        //HOT_LRU|WARM_LRU : 队列逐出的时候会去队列尾部看看是否有过期的数据如果有则淘汰,没有则不淘汰
-        //COLD_LRU : 队列逐出的时候会去尾部看看是否有过期的数据如果有则淘汰,如果没有也会淘汰.
-        
-        //第二种情况不开启 lru_maintainer_thread 线程
-        //id    =>  COLD_LRU  按照使用已使用item顺序先后加在该队列里面,头部最新使用的item,尾部最旧使用的item
-        //COLD_LRU : 队列逐出原则,就是从尾部依次淘汰跟上面原则一样.
-        //
     if (it == NULL) {
         pthread_mutex_lock(&lru_locks[id]);
         itemstats[id].outofmemory++;
@@ -348,7 +351,6 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     /* Items are initially loaded into the HOT_LRU. This is '0' but I want at
      * least a note here. Compiler (hopefully?) optimizes this out.
      */
-    //判断当前获取item加在那条LRU队列上
     if (settings.temp_lru &&
             exptime - current_time <= settings.temporary_ttl) {
         id |= TEMP_LRU;
@@ -513,8 +515,10 @@ int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
+    //it->time 记录添加时间
     it->time = current_time;
 
+    //统计更新
     STATS_LOCK();
     stats_state.curr_bytes += ITEM_ntotal(it);
     stats_state.curr_items += 1;
@@ -522,10 +526,29 @@ int do_item_link(item *it, const uint32_t hv) {
     STATS_UNLOCK();
 
     /* Allocate a new CAS ID on link. */
+    /* 如果开启cas则设置一个新的cas版本号 */
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+    //添加到hash表
     assoc_insert(it, hv);
+    //添加到LRU队列
     item_link_q(it);
+
+    //为什么这里要引用+1   
+    
+    //(一)
+    //因为我们这个item是新的,不是通过 item_get() hash表获取的,所以没有默认+1
+    //如果是通过item_get() hash表取出来的都会默认+1,不需要像下面还手动+1
+    
+    //(二)
+    //因为memcache在每个请求结束之后都会把当前的item引用-1,如果等于0则会被free掉.
+    //这里为了保证不被free掉则引用+1
+
+    //(三) 
+    //或者我们这里把这个key刚添加到hash，就被另一个线程给del了，但是我们本次set操作
+    //还没做完，这就可能导致本次非法操作这个item，所以这里把引用+1，保证我们这个item不会
+    //被马上del,也是做一个延时删除的作用大概.
     refcount_incr(it);
+
     item_stats_sizes_add(it);
 
     return 1;

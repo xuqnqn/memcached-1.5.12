@@ -88,11 +88,15 @@ void slabs_set_storage(void *arg) {
  * 0 means error: can't store such a large object
  */
 
+//根据要申请的内存大小定位对应的存放区域 id， slabs_clsid 函数
 unsigned int slabs_clsid(const size_t size) {
     int res = POWER_SMALLEST;
 
     if (size == 0 || size > settings.item_size_max)
         return 0;
+
+    //如果size不大于当前区域,就代表当前区域可以存放size大小
+    //返回区域id
     while (size > slabclass[res].size)
         if (res++ == power_largest)     /* won't fit in the biggest slab */
             return power_largest;
@@ -386,6 +390,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
     }
+    //通过id获取slabclass指向区域指针
     p = &slabclass[id];
     assert(p->sl_curr == 0 || ((item *)p->slots)->slabs_clsid == 0);
     if (total_bytes != NULL) {
@@ -395,19 +400,34 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     assert(size <= p->size);
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
+    //判断当前区域是否还有剩余的item,如果没有那么就在去申请1M内存
+    //同时再划分若干item，之前内存模型有说明.   
     if (p->sl_curr == 0 && flags != SLABS_ALLOC_NO_NEWPAGE) {
         do_slabs_newslab(id);
     }
 
     if (p->sl_curr != 0) {
         /* return off our freelist */
+        /* 获取一个item */
         it = (item *)p->slots;
+        //更新剩余的item
         p->slots = it->next;
         if (it->next) it->next->prev = 0;
         /* Kill flag and initialize refcount here for lock safety in slab
          * mover's freeness detection. */
         it->it_flags &= ~ITEM_SLABBED;
+
+        //默认item引用是1,之后只要有新的请求操作该item都会加1,处理完之后在减1
+        //如果等于0则系统会销毁该item
+        
+        //之所以用这个引用有一个好处就是延时删除item,比如有一个A请求正在操作该item
+        //这个时候一个B请求发送过来删除该item命令,如果在A请求没处理完成之前被B请求删除了
+        //那么A请求在操作这个item就是非法操作内存了,会造成一些问题,但是如果有refcount引用
+        //就不会有问题了, A请求 refcount+1 = 2 B请求 refcount-1 = 1 不等于0,所以暂时先不删除
+        //等A请求处理完毕之后再解除引用 refcount-1 = 0 整好等于0 删除之.
         it->refcount = 1;
+
+        //空闲item数量更新
         p->sl_curr--;
         ret = (void *)it;
     } else {
@@ -713,6 +733,10 @@ void *slabs_alloc(size_t size, unsigned int id, uint64_t *total_bytes,
         unsigned int flags) {
     void *ret;
 
+    //这里可以看到每次要去指定的slabclass[id]区域获取item都会
+    //锁住整个slabclass,理论上应该去哪个区域获取item就锁住哪个
+    //区域应该类似于采用(行锁)不应该采用(表锁),操作哪个id就
+    //锁住哪个id
     pthread_mutex_lock(&slabs_lock);
     ret = do_slabs_alloc(size, id, total_bytes, flags);
     pthread_mutex_unlock(&slabs_lock);
